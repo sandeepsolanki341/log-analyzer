@@ -24,7 +24,7 @@ class CheckpointStoreTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        String url = "jdbc:h2:mem:cp;MODE=MySQL;DB_CLOSE_DELAY=-1";
+        String url = "jdbc:h2:mem:cp_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1";
         keepAlive = DriverManager.getConnection(url);
         try (Statement st = keepAlive.createStatement()) {
             st.execute("CREATE TABLE IF NOT EXISTS pipeline_state ("
