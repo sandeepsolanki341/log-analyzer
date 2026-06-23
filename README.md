@@ -1,4 +1,4 @@
-# HealthSpan Log Analysis Pipeline
+# Sandeep Log Analysis Pipeline
 
 A production-grade Java ETL service that streams application logs from **MySQL** into
 **Elasticsearch** (visualized in **Kibana**), enriching and analyzing them in flight. It is built
@@ -135,7 +135,7 @@ deterministic `esId`, time-based `targetIndex`).
 ## Project layout
 
 ```
-src/main/java/com/healthspan/pipeline/
+src/main/java/com/sandeep/pipeline/
   extract/   keyset extractor, checkpoint, raw record
   parse/     parser (Jackson, nested-JSON flattening), dead-letter, log event/level
   analyze/   classifier, fingerprinter, enricher, correlator,
