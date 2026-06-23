@@ -27,7 +27,7 @@ class CheckpointStoreTest {
         String url = "jdbc:h2:mem:cp;MODE=MySQL;DB_CLOSE_DELAY=-1";
         keepAlive = DriverManager.getConnection(url);
         try (Statement st = keepAlive.createStatement()) {
-            st.execute("CREATE TABLE pipeline_state ("
+            st.execute("CREATE TABLE IF NOT EXISTS pipeline_state ("
                     + "pipeline_name VARCHAR(128) NOT NULL,"
                     + "last_processed_id BIGINT NOT NULL DEFAULT 0,"
                     + "PRIMARY KEY (pipeline_name))");
