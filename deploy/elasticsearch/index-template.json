@@ -1,0 +1,34 @@
+{
+  "index_patterns": ["app-logs-*", "app-alerts-*"],
+  "priority": 200,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 1,
+      "refresh_interval": "5s"
+    },
+    "mappings": {
+      "dynamic": "true",
+      "properties": {
+        "@timestamp":  { "type": "date" },
+        "level":       { "type": "keyword" },
+        "service":     { "type": "keyword" },
+        "message":     { "type": "text" },
+        "sourceId":    { "type": "long" },
+        "userId":      { "type": "long" },
+        "ip":          { "type": "ip", "ignore_malformed": true },
+        "statusCode":  { "type": "integer" },
+        "latencyMs":   { "type": "long" },
+        "stackTrace":  { "type": "text" },
+        "category":    { "type": "keyword" },
+        "domain":      { "type": "keyword" },
+        "severity":    { "type": "keyword" },
+        "fingerprint": { "type": "keyword" },
+        "traceId":     { "type": "keyword" },
+        "synthetic":   { "type": "boolean" },
+        "enrichment":  { "type": "object", "dynamic": "true" },
+        "fields":      { "type": "object", "dynamic": "true" }
+      }
+    }
+  }
+}
