@@ -1,5 +1,6 @@
 package com.sandeep.pipeline.analyze;
 
+import com.sandeep.pipeline.analyze.Fingerprinter;
 import com.sandeep.pipeline.parse.LogEvent;
 import com.sandeep.pipeline.parse.LogLevel;
 import org.junit.jupiter.api.Test;

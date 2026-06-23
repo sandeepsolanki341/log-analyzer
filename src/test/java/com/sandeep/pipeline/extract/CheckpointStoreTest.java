@@ -4,6 +4,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import com.sandeep.pipeline.extract.CheckpointStore;
+
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.DriverManager;

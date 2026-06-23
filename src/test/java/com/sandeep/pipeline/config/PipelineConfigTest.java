@@ -2,6 +2,8 @@ package com.sandeep.pipeline.config;
 
 import org.junit.jupiter.api.Test;
 
+import com.sandeep.pipeline.config.PipelineConfig;
+
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.*;

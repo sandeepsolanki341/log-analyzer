@@ -2,6 +2,8 @@ package com.sandeep.pipeline.parse;
 
 import org.junit.jupiter.api.Test;
 
+import com.sandeep.pipeline.parse.LogLevel;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 class LogLevelTest {
