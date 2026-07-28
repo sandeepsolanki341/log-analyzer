@@ -1,153 +1,180 @@
-# Sandeep Log Analysis Pipeline
+# Real-Time Multi-Source Log Analytics Platform
 
-A production-grade Java ETL service that streams application logs from **MySQL** into
-**Elasticsearch** (visualized in **Kibana**), enriching and analyzing them in flight. It is built
-around four reliability guarantees and event-time anomaly detection.
+A production-grade Java ETL platform that ingests application logs from **four heterogeneous sources** — **MySQL**, **MongoDB**, **Redis Streams**, and **Kafka** — into **Elasticsearch** (visualized in **Kibana**), with in-flight enrichment, event-time anomaly detection, and a built-in operational surface (health, readiness, Prometheus metrics).
+
+Built in **plain Java 21** — no framework runtime. Dependencies are wired by hand in an explicit composition root, which keeps startup fast, the dependency graph readable, and the failure modes obvious.
+
+Built during an internship at **Jio Platforms Limited** (Jun–Jul 2026).
+
+## Architecture
+
+The platform uses a **hub-and-spoke architecture** with **Kafka as the durable ingestion backbone**. Each source has a dedicated connector that publishes normalized log events to Kafka, which then feeds a horizontally scalable consumer group running a three-stage pipeline: **parse → analyze → bulk index**.
 
 ```
-MySQL (raw) → Extractor → Parser → Analyzer → Bulk Indexer → Elasticsearch → Kibana
-                 │            │          │            │
-            checkpoint   dead-letter  event-time   dead-letter
-            (keyset)     (parse)      window +     (index) +
-                                      Redis EMA    sub-batching
+┌─────────────┐
+│   MySQL     │──► MySQL Connector (keyset pagination)
+└─────────────┘                                          ┌──────────┐
+┌─────────────┐                                          │          │    ┌────────────────┐
+│  MongoDB    │──► MongoDB Connector (ObjectId cursors) ─►│  Kafka   │───►│ Consumer Group  │
+└─────────────┘                                          │ (hub)    │    │                │
+┌─────────────┐                                          │          │    │  Parse          │
+│Redis Streams│──► Redis Connector (stream entry IDs)  ─►│          │    │  ↓              │
+└─────────────┘                                          │          │    │  Analyze        │
+┌─────────────┐                                          │          │    │  ↓              │
+│External Kafka│──► Kafka Connector (consumer offsets) ─►│          │    │  Bulk Index     │
+└─────────────┘                                          └──────────┘    └───────┬────────┘
+                                                                                │
+                                                              ┌─────────────────┼──────────────┐
+                                                              │                 │              │
+                                                              ▼                 ▼              ▼
+                                                        Elasticsearch       Kibana       Health / Metrics
+                                                        (app-logs-*)      (visualize)    HTTP endpoints
+                                                        (app-alerts-*)                   (Prometheus)
 ```
 
-## Reliability model
+## Reliability Model
 
 | Guarantee | How |
 |---|---|
-| **At-least-once delivery** | Durable `CheckpointStore` high-water mark advanced only after a batch is confirmed downstream. |
-| **Effectively exactly-once storage** | Deterministic Elasticsearch `_id` (`applog-<rowId>`) ⇒ replays overwrite, never duplicate. |
-| **Poison-pill immunity** | Per-row parse dead-letter + per-document index dead-letter. One bad row/doc never halts the pipeline. |
-| **Natural backpressure** | Synchronous batch handoff; when Elasticsearch slows, the indexer blocks, which pauses extraction instead of growing memory. |
+| **At-least-once delivery** | Each connector maintains a durable checkpoint (MySQL row IDs, MongoDB ObjectId cursors, Redis stream entry IDs, Kafka consumer offsets). Checkpoints advance only after downstream acknowledgment. |
+| **Effectively exactly-once storage** | Deterministic Elasticsearch `_id` per document (`applog-<source>-<sourceId>`). Crash replays overwrite, never duplicate. |
+| **Poison-pill immunity** | Per-record parse dead-letter + per-document index dead-letter. One bad record never halts any pipeline stage. |
+| **Backpressure** | Kafka consumer pause/resume: when Elasticsearch or downstream processing slows, consumers pause partition fetching instead of growing memory. Jittered-backoff bulk retries on transient ES failures. |
+| **Dead-letter isolation** | Poison messages that exhaust retries are routed to dead-letter topics/tables for later inspection without blocking the main pipeline. |
 
-## What makes this more than a reference implementation
+## Key Design Decisions
 
-- **Event-time sliding window.** Aggregation is keyed on each event's own timestamp with a
-  watermark, so error rates stay correct during backlog catch-up and replay (processing-time windows
-  silently lie exactly when an incident is unfolding). Recording is idempotent per `sourceId`, so a
-  replayed batch never double-counts.
-- **Durable anomaly baseline.** The trailing EMA used for spike detection is persisted in **Redis**,
-  so a restart resumes from the learned baseline instead of cold-starting and missing (or inventing)
-  a spike during warm-up. Falls back to in-memory if Redis is unavailable.
-- **Bulk sub-batching by count *and* bytes.** A large extractor batch is split into ES bulk requests
-  bounded by both document count and byte size, preventing `http.max_content_length` overruns and
-  heap spikes independent of the fetch size.
-- **Interrupt-aware indexing & non-overlapping scheduling.** Backoff propagates interrupts so
-  shutdown is prompt; a single-thread `scheduleWithFixedDelay` guarantees runs never overlap
-  (protecting the single-writer aggregator/checkpoint).
-- **Deterministic, idempotent alerts.** Synthetic alert documents get a stable id
-  (`alert-<rule>-<subject>-<epochSecond>`) and route to a separate `app-alerts-*` index.
-- **Operational surface.** Liveness/readiness endpoints and Prometheus metrics over a tiny built-in
-  HTTP server; graceful SIGTERM shutdown.
+- **Hub-and-spoke over point-to-point.** Rather than wiring each source directly to Elasticsearch, every connector publishes to a single Kafka topic. This decouples ingestion rate from indexing rate, lets the consumer group scale independently of the sources, and allows adding a new source without touching downstream processing.
 
-## Quick start (full local stack)
+- **Unified connector pattern.** All four connectors share the same interface: fetch a batch → normalize to a common log event schema → publish to Kafka → commit checkpoint. Source-specific logic (keyset pagination for MySQL, ObjectId cursors for MongoDB, `XREAD` with entry IDs for Redis Streams, standard consumer offsets for Kafka) is encapsulated per connector.
+
+- **Event-time sliding window anomaly detection.** Aggregation is keyed on each event's own timestamp with a watermark, so error rates stay correct during backlog catch-up and replay. Processing-time windows silently lie exactly when an incident is unfolding. Recording is idempotent per `sourceId`.
+
+- **Durable anomaly baseline.** The trailing EMA used for spike detection is persisted in **Redis**, so a restart resumes from the learned baseline instead of cold-starting and missing (or inventing) a spike during warm-up. Falls back to in-memory if Redis is unavailable.
+
+- **Bulk sub-batching by count *and* bytes.** A large consumer batch is split into ES bulk requests bounded by both document count and byte size, preventing `http.max_content_length` overruns and heap spikes.
+
+- **Deterministic, idempotent alerts.** Synthetic alert documents get a stable id (`alert-<rule>-<subject>-<epochSecond>`) and route to a separate `app-alerts-*` index.
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Java 21 |
+| Runtime | Plain Java, manual DI (no framework) |
+| Sources | MySQL, MongoDB, Redis Streams, Apache Kafka |
+| Message Broker | Apache Kafka (ingestion hub) |
+| Search & Analytics | Elasticsearch, Kibana |
+| Anomaly Baseline | Redis (EMA persistence) |
+| Ops Surface | Built-in HTTP server (health, readiness, metrics) |
+| Containerization | Docker, Docker Compose |
+| CI/CD | GitHub Actions |
+| Testing | JUnit, Testcontainers |
+| Monitoring | Prometheus metrics, liveness/readiness endpoints |
+
+## Quick Start (Full Local Stack)
 
 ```bash
 docker compose up --build
 ```
 
-This brings up MySQL (with schema + sample rows), Elasticsearch, Kibana, Redis, applies the ES index
-template, and starts the pipeline. Then:
+This brings up MySQL, MongoDB, Redis, Kafka (with Zookeeper), Elasticsearch, Kibana, and the pipeline service. Then:
 
-- Kibana: http://localhost:5601 (create a data view for `app-logs-*` and `app-alerts-*`)
-- Pipeline health: http://localhost:8080/health/ready
-- Metrics: http://localhost:8080/metrics
+- **Kibana:** [http://localhost:5601](http://localhost:5601) — create data views for `app-logs-*` and `app-alerts-*`
+- **Pipeline health:** [http://localhost:8080/health/ready](http://localhost:8080/health/ready)
+- **Metrics:** [http://localhost:8080/metrics](http://localhost:8080/metrics)
 
-Insert more logs into `app_logs` and watch them appear in Kibana within a few seconds.
-
-## Build & test
+## Build & Test
 
 ```bash
 mvn clean test        # unit tests
-mvn verify            # + Testcontainers integration test (needs Docker)
+mvn verify            # + Testcontainers integration tests (needs Docker)
 mvn package           # runnable fat jar at target/log-analysis-pipeline.jar
 ```
 
-Run the jar directly (configure via env vars — see below):
+Run the jar directly (configure via env vars):
 
 ```bash
+KAFKA_BOOTSTRAP=localhost:9092 \
 DB_URL='jdbc:mysql://localhost:3306/logs?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true' \
 DB_USER=root DB_PASSWORD=secret \
-ES_HOST=localhost ES_PORT=9200 \
+MONGO_URI='mongodb://localhost:27017/logs' \
 REDIS_HOST=localhost \
+ES_HOST=localhost ES_PORT=9200 \
 java -jar target/log-analysis-pipeline.jar
 ```
 
 ## Configuration
 
-Every key has a default (see `src/main/resources/application.properties`) and is overridable by the
-matching environment variable (`db.url` → `DB_URL`). Secrets should come from the environment / a
-secrets manager, not the properties file.
+Every key has a default (see `src/main/resources/application.properties`) and is overridable by the matching environment variable. Secrets should come from the environment or a secrets manager.
+
+### Core
 
 | Env var | Default | Notes |
 |---|---|---|
-| `DB_URL` | `jdbc:mysql://localhost:3306/logs?...` | Pin the session to UTC (see Timestamps). |
-| `DB_USER` / `DB_PASSWORD` | `root` / _(empty)_ | |
-| `DB_POOL_SIZE` | `8` | HikariCP max pool size. |
-| `SOURCE_ZONE` | `UTC` | Zone for zoneless `DATETIME` timestamps. |
-| `PIPELINE_NAME` | `app-logs` | Checkpoint row key. |
-| `BATCH_SIZE` | `5000` | Rows per extraction batch (keyset `LIMIT`). |
+| `KAFKA_BOOTSTRAP` | `localhost:9092` | Kafka broker address |
+| `KAFKA_CONSUMER_GROUP` | `log-analytics` | Consumer group for the processing pipeline |
+| `KAFKA_INGEST_TOPIC` | `raw-logs` | Topic all connectors publish to |
+| `DB_URL` | `jdbc:mysql://localhost:3306/logs?...` | MySQL source; pin session to UTC |
+| `DB_USER` / `DB_PASSWORD` | `root` / *(empty)* | |
+| `MONGO_URI` | `mongodb://localhost:27017/logs` | MongoDB source connection |
+| `MONGO_COLLECTION` | `app_logs` | Collection to tail |
+| `REDIS_STREAM_KEY` | `app:logs` | Redis Stream key to consume |
 | `ES_HOST` / `ES_PORT` / `ES_SCHEME` | `localhost` / `9200` / `http` | |
-| `ES_USERNAME` / `ES_PASSWORD` / `ES_API_KEY` | _(none)_ | API key takes precedence over basic auth. |
-| `INDEX_SUB_BATCH_SIZE` | `500` | Max docs per ES bulk request. |
-| `INDEX_MAX_BYTES` | `5242880` | Max bytes per ES bulk request. |
-| `BULK_MAX_ATTEMPTS` | `4` | Total attempts incl. first. |
-| `BULK_BASE_DELAY_MS` / `BULK_MAX_DELAY_MS` | `1000` / `30000` | Exponential backoff with full jitter. |
-| `WINDOW_SECONDS` | `300` | Event-time analysis window width. |
-| `ANOMALY_SPIKE_MULTIPLIER` | `3.0` | Fire when rate > multiplier × trailing EMA. |
-| `ANOMALY_MIN_EVENTS` | `50` | Min window volume before the rate rule trusts itself. |
-| `ANOMALY_FAILED_LOGIN_THRESHOLD` | `20` | Failed logins per IP that trip a security alert. |
-| `ANOMALY_EMA_ALPHA` | `0.3` | Baseline smoothing factor (0,1]. |
-| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | `localhost` / `6379` / _(none)_ | Baseline store. |
-| `RUN_INTERVAL_SECONDS` | `10` | Delay between (non-overlapping) runs. |
-| `HEALTH_PORT` | `8080` | Liveness/readiness/metrics. |
-| `SHUTDOWN_GRACE_SECONDS` | `30` | Graceful shutdown budget. |
 
-### Timestamps (read this)
+### Reliability & Tuning
 
-`app_logs.ts` is a zoneless `DATETIME`, interpreted in `SOURCE_ZONE` (default UTC). If your services
-write a MySQL `TIMESTAMP` column instead, MySQL stores it as UTC and the JDBC driver converts to the
-session zone — so pin the session to UTC in the JDBC URL
-(`connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true`) and keep `SOURCE_ZONE=UTC`.
-Mismatching these shifts every event by the zone offset.
+| Env var | Default | Notes |
+|---|---|---|
+| `BATCH_SIZE` | `5000` | Records per connector fetch cycle |
+| `INDEX_SUB_BATCH_SIZE` | `500` | Max docs per ES bulk request |
+| `INDEX_MAX_BYTES` | `5242880` | Max bytes per ES bulk request |
+| `BULK_MAX_ATTEMPTS` | `4` | Total attempts incl. first |
+| `BULK_BASE_DELAY_MS` / `BULK_MAX_DELAY_MS` | `1000` / `30000` | Exponential backoff with full jitter |
 
-## Data model evolution
+### Anomaly Detection
 
-`RawLogRecord` (untrusted DB row) → `LogEvent` (clean, UTC `Instant`, canonical `LogLevel`,
-extracted fields) → `AnalyzedEvent` (+ classification, fingerprint, enrichment, trace id,
-deterministic `esId`, time-based `targetIndex`).
+| Env var | Default | Notes |
+|---|---|---|
+| `WINDOW_SECONDS` | `300` | Event-time sliding window width |
+| `ANOMALY_SPIKE_MULTIPLIER` | `3.0` | Fire when rate > multiplier × trailing EMA |
+| `ANOMALY_MIN_EVENTS` | `50` | Min window volume before the rule activates |
+| `ANOMALY_EMA_ALPHA` | `0.3` | Baseline smoothing factor (0,1] |
+| `ANOMALY_FAILED_LOGIN_THRESHOLD` | `20` | Failed logins per IP that trip a security alert |
 
-## Schema & index template
+## Data Model Evolution
 
-- MySQL: `deploy/sql/schema.sql` (source table, checkpoint, two dead-letter tables).
-- Elasticsearch: `deploy/elasticsearch/index-template.json` (apply with `apply-template.sh` before
-  first ingest so `@timestamp` is a `date` and key fields are `keyword`).
+```
+RawLogRecord (untrusted source row/document)
+  → LogEvent (clean, UTC Instant, canonical LogLevel, extracted fields)
+    → AnalyzedEvent (+ classification, fingerprint, enrichment, trace id,
+                      deterministic esId, time-based targetIndex)
+```
 
 ## Operations
 
-- **Readiness** returns 200 only after at least one successful run and a live DB connection.
-- **Dead-letter monitoring**: alert on growth of `parse_dead_letter` (usually a service changed log
-  format) and `index_dead_letter` (mapping conflicts). Both are idempotent and safe to reprocess.
-- **Metrics** (Prometheus): rows extracted/parsed, events analyzed, alerts raised, docs
-  indexed/dead-lettered, bulk retries, index/run latency, last-run timestamp, backlog estimate.
+- **Readiness** returns 200 only after at least one successful run and live connections to all configured sources.
+- **Dead-letter monitoring:** alert on growth of dead-letter topics/tables — parse dead-letters usually indicate a source changed its log format; index dead-letters indicate ES mapping conflicts.
+- **Metrics (Prometheus):** records extracted per source, events parsed, events analyzed, alerts raised, docs indexed/dead-lettered, bulk retries, consumer lag, dispatch latency, last-run timestamp.
 
-## Project layout
+## Project Layout
 
 ```
 src/main/java/com/sandeep/pipeline/
-  extract/   keyset extractor, checkpoint, raw record
-  parse/     parser (Jackson, nested-JSON flattening), dead-letter, log event/level
-  analyze/   classifier, fingerprinter, enricher, correlator,
-             event-time window, anomaly detector, Redis/in-memory baseline
-  index/     bulk indexer (sub-batching, backoff, triage), ES transport, dead-letter, JSON writer
-  config/    env/properties-driven config with validation
-  runner/    chain (BatchConsumer), wiring (composition root), scheduler, Main
-  health/    liveness/readiness/metrics HTTP server
-  util/      shared Jackson mapper, Micrometer metrics
-deploy/      sql schema + seed, ES index template + apply script
+  connector/   source connectors (MySQL, MongoDB, Redis, Kafka) + unified interface
+  extract/     keyset extractor, checkpoint store, raw record
+  parse/       parser (Jackson, nested-JSON flattening), dead-letter, log event/level
+  analyze/     classifier, fingerprinter, enricher, correlator,
+               event-time window, anomaly detector, Redis/in-memory baseline
+  index/       bulk indexer (sub-batching, backoff, triage), ES transport, dead-letter
+  config/      env/properties-driven config with validation
+  runner/      chain (BatchConsumer), wiring (composition root), scheduler, Main
+  health/      liveness/readiness/metrics HTTP server (built-in, no framework)
+  util/        shared Jackson mapper, Micrometer metrics
+deploy/        docker-compose, sql schema + seed, ES index template, Kafka topic setup
+docs/          ARCHITECTURE.md
 ```
 
 ## License
 
-MIT — see `LICENSE`. Architecture hardening notes: `docs/ARCHITECTURE.md`.
+MIT — see `LICENSE`.
